@@ -12,6 +12,13 @@ use Illuminate\Database\Eloquent\Relations\BelongsTo;
     'network',
     'phone',
     'status',
+    'provider',
+    'provider_transaction_id',
+    'provider_reference',
+    'provider_status',
+    'provider_failure_reason',
+    'provider_payload',
+    'provider_last_webhook_at',
     'reference',
     'requested_at',
     'processed_at',
@@ -23,6 +30,8 @@ class PassengerDeposit extends Model
         return [
             'requested_at' => 'datetime',
             'processed_at' => 'datetime',
+            'provider_payload' => 'array',
+            'provider_last_webhook_at' => 'datetime',
         ];
     }
 
@@ -31,4 +40,3 @@ class PassengerDeposit extends Model
         return $this->belongsTo(User::class);
     }
 }
-

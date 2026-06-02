@@ -4,9 +4,10 @@ use App\Http\Controllers\Api\AdminVerificationController;
 use App\Http\Controllers\Api\AuthController;
 use App\Http\Controllers\Api\ChatController;
 use App\Http\Controllers\Api\DriverController;
-use App\Http\Controllers\Api\DriverVehicleDocumentController;
 use App\Http\Controllers\Api\DriverSubscriptionController;
+use App\Http\Controllers\Api\DriverVehicleDocumentController;
 use App\Http\Controllers\Api\DriverWalletController;
+use App\Http\Controllers\Api\FedaPayWebhookController;
 use App\Http\Controllers\Api\NotificationController;
 use App\Http\Controllers\Api\PassengerController;
 use App\Http\Controllers\Api\PassengerWalletController;
@@ -14,6 +15,8 @@ use App\Http\Controllers\Api\ProfileController;
 use App\Http\Controllers\Api\SettingsController;
 use App\Http\Controllers\Api\SupportController;
 use Illuminate\Support\Facades\Route;
+
+Route::post('/payments/fedapay/webhook', [FedaPayWebhookController::class, 'handle']);
 
 Route::prefix('auth')->group(function (): void {
     Route::post('/register', [AuthController::class, 'register']);
@@ -107,4 +110,3 @@ Route::middleware('auth:sanctum')->prefix('admin/verifications')->group(function
     Route::get('/{verification}', [AdminVerificationController::class, 'show']);
     Route::patch('/{verification}', [AdminVerificationController::class, 'review']);
 });
-

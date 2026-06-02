@@ -9,15 +9,24 @@ use App\Models\DriverWithdrawal;
 use App\Models\User;
 use App\Models\UserNotification;
 use App\Rules\BeninPhoneNumber;
+use App\Services\FedaPay\FedaPayGateway;
+use App\Services\Wallet\WalletSettlementService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Str;
 use Illuminate\Validation\ValidationException;
+use RuntimeException;
+use Throwable;
 
 class DriverWalletController extends Controller
 {
+    public function __construct(
+        private readonly FedaPayGateway $fedaPayGateway,
+        private readonly WalletSettlementService $walletSettlementService,
+    ) {}
+
     public function show(Request $request): JsonResponse
     {
         /** @var User $user */
@@ -132,10 +141,16 @@ class DriverWalletController extends Controller
             }
 
             $currentBalance = (int) ($lockedUser->driver_wallet_balance_fcfa ?? 0);
+            $reservedProcessing = $this->processingWithdrawalsAmount($lockedUser);
+            $withdrawableBalance = max(0, $currentBalance - $reservedProcessing);
 
-            if ($currentBalance < $amount) {
+            if ($withdrawableBalance < $amount) {
                 $pendingBalance = $this->pendingPayoutAmount($lockedUser);
                 $message = 'Solde disponible insuffisant pour ce retrait.';
+
+                if ($reservedProcessing > 0) {
+                    $message .= ' '.$reservedProcessing.' FCFA sont deja en cours de retrait et temporairement reserves.';
+                }
 
                 if ($pendingBalance > 0) {
                     $message .= ' '.$pendingBalance.' FCFA sont en attente de confirmation passager et ne sont pas encore retirables.';
@@ -151,21 +166,17 @@ class DriverWalletController extends Controller
                 'amount_fcfa' => $amount,
                 'network' => $network,
                 'phone' => (string) $lockedUser->phone,
-                'status' => 'completed',
+                'status' => 'processing',
+                'provider' => $this->fedaPayGateway->isEnabled() ? 'fedapay' : 'internal',
                 'reference' => $this->withdrawalReference(),
                 'requested_at' => now(),
-                'processed_at' => now(),
             ]);
-
-            $lockedUser->forceFill([
-                'driver_wallet_balance_fcfa' => max(0, $currentBalance - $amount),
-            ])->save();
 
             $this->createUserNotification(
                 $lockedUser,
-                'driver_withdrawal_completed',
-                'Retrait effectue',
-                'Votre retrait de '.$amount.' FCFA vers '.$this->networkLabel($network).' est confirme.',
+                'driver_withdrawal_processing',
+                'Retrait en cours',
+                'Votre demande de retrait de '.$amount.' FCFA est en cours de traitement.',
                 [
                     'withdrawal_id' => $withdrawal->id,
                     'reference' => $withdrawal->reference,
@@ -178,11 +189,71 @@ class DriverWalletController extends Controller
             return $withdrawal;
         });
 
-        return response()->json([
-            'message' => 'Retrait valide et transfert securise vers votre numero de profil.',
-            'wallet' => $this->walletPayload($user->fresh()),
-            'withdrawal' => $this->serializeWithdrawal($withdrawal),
-        ]);
+        if (! $this->fedaPayGateway->isEnabled()) {
+            $withdrawal = $this->walletSettlementService->completeDriverWithdrawal($withdrawal);
+
+            return response()->json([
+                'message' => 'Retrait valide et transfert securise vers votre numero de profil.',
+                'wallet' => $this->walletPayload($user->fresh()),
+                'withdrawal' => $this->serializeWithdrawal($withdrawal),
+            ]);
+        }
+
+        try {
+            $providerResult = $this->fedaPayGateway->initiateWithdrawal(
+                $user->fresh() ?? $user,
+                (string) $withdrawal->network,
+                (string) $withdrawal->phone,
+                (int) $withdrawal->amount_fcfa,
+                (string) $withdrawal->reference,
+                'driver_withdrawal',
+                (int) $withdrawal->id,
+            );
+
+            $withdrawal->forceFill([
+                'provider' => (string) ($providerResult['provider'] ?? 'fedapay'),
+                'provider_transaction_id' => $providerResult['provider_transaction_id'] ?? null,
+                'provider_reference' => $providerResult['provider_reference'] ?? null,
+                'provider_status' => $providerResult['provider_status'] ?? null,
+                'provider_payload' => $providerResult['provider_payload'] ?? null,
+            ])->save();
+
+            $localStatus = (string) ($providerResult['local_status'] ?? 'processing');
+            $message = 'Demande de retrait transmise. Validation en cours sur FeDaPay.';
+
+            if ($localStatus === 'completed') {
+                $withdrawal = $this->walletSettlementService->completeDriverWithdrawal($withdrawal);
+                $message = 'Retrait confirme par FeDaPay et transfert effectue.';
+            } elseif ($localStatus === 'failed') {
+                $withdrawal = $this->walletSettlementService->failDriverWithdrawal(
+                    $withdrawal,
+                    is_string($providerResult['provider_status'] ?? null) ? (string) $providerResult['provider_status'] : null,
+                );
+                $message = 'Demande de retrait refusee par FeDaPay.';
+            }
+
+            return response()->json([
+                'message' => $message,
+                'wallet' => $this->walletPayload($user->fresh()),
+                'withdrawal' => $this->serializeWithdrawal($withdrawal->fresh()),
+            ]);
+        } catch (RuntimeException $exception) {
+            $withdrawal = $this->walletSettlementService->failDriverWithdrawal($withdrawal, $exception->getMessage());
+
+            return response()->json([
+                'message' => 'La demande de retrait a echoue: '.$exception->getMessage(),
+                'wallet' => $this->walletPayload($user->fresh()),
+                'withdrawal' => $this->serializeWithdrawal($withdrawal->fresh()),
+            ], 502);
+        } catch (Throwable) {
+            $withdrawal = $this->walletSettlementService->failDriverWithdrawal($withdrawal, 'Erreur technique FeDaPay.');
+
+            return response()->json([
+                'message' => 'La demande de retrait a echoue suite a une erreur technique FeDaPay.',
+                'wallet' => $this->walletPayload($user->fresh()),
+                'withdrawal' => $this->serializeWithdrawal($withdrawal->fresh()),
+            ], 502);
+        }
     }
 
     public function deposit(Request $request): JsonResponse
@@ -227,21 +298,17 @@ class DriverWalletController extends Controller
                 'amount_fcfa' => $amount,
                 'network' => $network,
                 'phone' => (string) $lockedUser->phone,
-                'status' => 'completed',
+                'status' => 'processing',
+                'provider' => $this->fedaPayGateway->isEnabled() ? 'fedapay' : 'internal',
                 'reference' => $this->depositReference(),
                 'requested_at' => now(),
-                'processed_at' => now(),
             ]);
-
-            $lockedUser->forceFill([
-                'driver_wallet_balance_fcfa' => max(0, (int) ($lockedUser->driver_wallet_balance_fcfa ?? 0) + $amount),
-            ])->save();
 
             $this->createUserNotification(
                 $lockedUser,
-                'driver_deposit_completed',
-                'Recharge confirmee',
-                'Votre recharge de '.$amount.' FCFA est confirmee et disponible dans votre solde conducteur.',
+                'driver_deposit_processing',
+                'Recharge en cours',
+                'Votre demande de recharge de '.$amount.' FCFA est en cours de traitement.',
                 [
                     'deposit_id' => $deposit->id,
                     'reference' => $deposit->reference,
@@ -254,11 +321,71 @@ class DriverWalletController extends Controller
             return $deposit;
         });
 
-        return response()->json([
-            'message' => 'Recharge confirmee et solde conducteur credite avec succes.',
-            'wallet' => $this->walletPayload($user->fresh()),
-            'deposit' => $this->serializeDeposit($deposit),
-        ]);
+        if (! $this->fedaPayGateway->isEnabled()) {
+            $deposit = $this->walletSettlementService->completeDriverDeposit($deposit);
+
+            return response()->json([
+                'message' => 'Recharge confirmee et solde conducteur credite avec succes.',
+                'wallet' => $this->walletPayload($user->fresh()),
+                'deposit' => $this->serializeDeposit($deposit),
+            ]);
+        }
+
+        try {
+            $providerResult = $this->fedaPayGateway->initiateDeposit(
+                $user->fresh() ?? $user,
+                (string) $deposit->network,
+                (string) $deposit->phone,
+                (int) $deposit->amount_fcfa,
+                (string) $deposit->reference,
+                'driver_deposit',
+                (int) $deposit->id,
+            );
+
+            $deposit->forceFill([
+                'provider' => (string) ($providerResult['provider'] ?? 'fedapay'),
+                'provider_transaction_id' => $providerResult['provider_transaction_id'] ?? null,
+                'provider_reference' => $providerResult['provider_reference'] ?? null,
+                'provider_status' => $providerResult['provider_status'] ?? null,
+                'provider_payload' => $providerResult['provider_payload'] ?? null,
+            ])->save();
+
+            $localStatus = (string) ($providerResult['local_status'] ?? 'processing');
+            $message = 'Demande de recharge transmise. Validez le paiement sur votre telephone.';
+
+            if ($localStatus === 'completed') {
+                $deposit = $this->walletSettlementService->completeDriverDeposit($deposit);
+                $message = 'Recharge confirmee par FeDaPay et solde credite.';
+            } elseif ($localStatus === 'failed') {
+                $deposit = $this->walletSettlementService->failDriverDeposit(
+                    $deposit,
+                    is_string($providerResult['provider_status'] ?? null) ? (string) $providerResult['provider_status'] : null,
+                );
+                $message = 'Demande de recharge refusee par FeDaPay.';
+            }
+
+            return response()->json([
+                'message' => $message,
+                'wallet' => $this->walletPayload($user->fresh()),
+                'deposit' => $this->serializeDeposit($deposit->fresh()),
+            ]);
+        } catch (RuntimeException $exception) {
+            $deposit = $this->walletSettlementService->failDriverDeposit($deposit, $exception->getMessage());
+
+            return response()->json([
+                'message' => 'La demande de recharge a echoue: '.$exception->getMessage(),
+                'wallet' => $this->walletPayload($user->fresh()),
+                'deposit' => $this->serializeDeposit($deposit->fresh()),
+            ], 502);
+        } catch (Throwable) {
+            $deposit = $this->walletSettlementService->failDriverDeposit($deposit, 'Erreur technique FeDaPay.');
+
+            return response()->json([
+                'message' => 'La demande de recharge a echoue suite a une erreur technique FeDaPay.',
+                'wallet' => $this->walletPayload($user->fresh()),
+                'deposit' => $this->serializeDeposit($deposit->fresh()),
+            ], 502);
+        }
     }
 
     private function ensureDriver(User $user): ?JsonResponse
@@ -277,13 +404,16 @@ class DriverWalletController extends Controller
      */
     private function walletPayload(User $user): array
     {
-        $available = (int) ($user->driver_wallet_balance_fcfa ?? 0);
+        $baseBalance = (int) ($user->driver_wallet_balance_fcfa ?? 0);
+        $processingWithdrawals = $this->processingWithdrawalsAmount($user);
+        $available = max(0, $baseBalance - $processingWithdrawals);
         $pending = $this->pendingPayoutAmount($user);
         $detectedNetwork = $this->detectNetworkFromPhone((string) $user->phone);
 
         return [
             'available_balance_fcfa' => $available,
             'pending_balance_fcfa' => $pending,
+            'processing_withdrawals_fcfa' => $processingWithdrawals,
             'total_balance_fcfa' => $available + $pending,
             'commission_rate_percent' => 5,
             'withdrawal_phone' => $user->phone,
@@ -296,6 +426,7 @@ class DriverWalletController extends Controller
             'recharge_network_label' => $detectedNetwork ? $this->networkLabel($detectedNetwork) : null,
             'recharge_network_supported' => $detectedNetwork !== null,
             'minimum_deposit_fcfa' => 500,
+            'provider' => $this->fedaPayGateway->isEnabled() ? 'fedapay' : 'internal',
         ];
     }
 
@@ -308,6 +439,14 @@ class DriverWalletController extends Controller
             ->sum('bookings.payout_amount_fcfa');
 
         return (int) $sum;
+    }
+
+    private function processingWithdrawalsAmount(User $user): int
+    {
+        return (int) DriverWithdrawal::query()
+            ->where('user_id', $user->id)
+            ->where('status', 'processing')
+            ->sum('amount_fcfa');
     }
 
     private function networkLabel(string $network): string
@@ -343,6 +482,8 @@ class DriverWalletController extends Controller
             'phone' => $withdrawal->phone,
             'status' => $withdrawal->status,
             'reference' => $withdrawal->reference,
+            'provider_status' => $withdrawal->provider_status,
+            'failure_reason' => $withdrawal->provider_failure_reason,
             'requested_at' => $withdrawal->requested_at,
             'processed_at' => $withdrawal->processed_at,
         ];
@@ -361,6 +502,8 @@ class DriverWalletController extends Controller
             'phone' => $deposit->phone,
             'status' => $deposit->status,
             'reference' => $deposit->reference,
+            'provider_status' => $deposit->provider_status,
+            'failure_reason' => $deposit->provider_failure_reason,
             'requested_at' => $deposit->requested_at,
             'processed_at' => $deposit->processed_at,
         ];
